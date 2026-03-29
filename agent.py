@@ -1,24 +1,9 @@
 from __future__ import annotations
 
-import json
-import os
+import re
 
-try:
-    from openai import OpenAI
-except ImportError:  # pragma: no cover - optional dependency
-    OpenAI = None
-
-from app.mcp_registry import available_tools, route_query, run_tool
+from app.mcp_registry import route_query, run_tool
 from app.trace import trace_event
-
-MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-
-def _client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key or OpenAI is None:
-        return None
-    return OpenAI(api_key=api_key)
 
 
 def _format_tool_result(tool_name: str, query: str, request_id: str | None = None) -> str:
@@ -27,22 +12,19 @@ def _format_tool_result(tool_name: str, query: str, request_id: str | None = Non
         "tool_executed",
         request_id=request_id,
         tool_name=tool_name,
-        route_source="direct" if tool_name == route_query(query) else "forced",
+        decision_source="keyword_router",
         query=query,
     )
     return f"Tool used: {tool_name}\n\n{result}"
 
 
-def _local_agent(query: str, request_id: str | None = None) -> str:
-    tool_name = route_query(query)
-    trace_event(
-        "local_route_selected",
-        request_id=request_id,
-        query=query,
-        tool_name=tool_name,
-        decision_source="keyword_router",
+def _has_time_hint(query: str) -> bool:
+    lowered = (query or "").lower()
+    return (
+        any(keyword in lowered for keyword in ["later", "tomorrow", "today", "tonight", "after"])
+        or re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", lowered) is not None
+        or re.search(r"\bat\b", lowered) is not None
     )
-    return _format_tool_result(tool_name, query, request_id)
 
 
 def run_agent(query: str, request_id: str | None = None):
@@ -52,108 +34,68 @@ def run_agent(query: str, request_id: str | None = None):
 
     trace_event("agent_started", request_id=request_id, query=query)
 
-    if route_query(query) == "share_details":
+    routed_tool = route_query(query)
+    if routed_tool == "scrape_configured_sites" and _has_time_hint(query):
+        trace_event(
+            "agent_scrape_schedule_redirected",
+            request_id=request_id,
+            query=query,
+            decision_source="keyword_router",
+        )
+        return (
+            "Scrape scheduling is manual from the admin panel.\n"
+            "Choose the scope in the dashboard: Pending URLs only or All config URLs.\n"
+            "Then use Run now to scrape immediately or Run later to schedule a one-off job."
+        )
+    if routed_tool in {"share_details", "schedule_task", "scrape_configured_sites"}:
         trace_event(
             "agent_tool_short_circuit",
             request_id=request_id,
             query=query,
-            tool_name="share_details",
+            tool_name=routed_tool,
             decision_source="keyword_router",
         )
-        return _format_tool_result("share_details", query, request_id)
+        return _format_tool_result(routed_tool, query, request_id)
 
-    client = _client()
-    if client is None:
+    from app.tools.rag import search_docs
+    from app.tools.web import web_search
+    from app.tools.utils import summarize_text
+
+    rag_answer = search_docs(query)
+    if not rag_answer.startswith("No strong match found"):
         trace_event(
-            "agent_fallback",
+            "agent_answer_from_db",
             request_id=request_id,
             query=query,
-            reason="missing_openai_client",
+            route="search_docs",
         )
-        return _local_agent(query, request_id)
+        return rag_answer
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an AI research assistant. "
-                "Use the available tools when they help answer the user's question. "
-                "Prefer search_docs for local project knowledge, web_search for current information, "
-                "summarize_text for compression, and share_details for email, WhatsApp, "
-                "or meeting scheduling requests."
-            ),
-        },
-        {"role": "user", "content": query},
-    ]
-
-    for _ in range(4):
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            tools=available_tools(),
-            tool_choice="auto",
-        )
-
-        message = response.choices[0].message
-        if not message.tool_calls:
-            trace_event(
-                "llm_answered_without_tool",
-                request_id=request_id,
-                query=query,
-                model=MODEL_NAME,
-            )
-            return message.content or _local_agent(query, request_id)
-
-        chosen_tools = [tool_call.function.name for tool_call in message.tool_calls]
+    trace_event(
+        "agent_db_miss",
+        request_id=request_id,
+        query=query,
+        route="web_search",
+    )
+    fallback_reason = "No strong match was found in the database; live web search was used."
+    web_answer = web_search(query)
+    if web_answer.startswith("No live web results could be parsed") or web_answer.startswith("Live web search failed"):
         trace_event(
-            "llm_selected_tools",
+            "agent_web_failed",
             request_id=request_id,
             query=query,
-            model=MODEL_NAME,
-            chosen_tools=chosen_tools,
-            tool_count=len(chosen_tools),
-            available_tools=[tool["function"]["name"] for tool in available_tools()],
         )
+        return web_answer
 
-        assistant_message = {
-            "role": "assistant",
-            "content": message.content or "",
-            "tool_calls": [
-                {
-                    "id": tool_call.id,
-                    "type": tool_call.type,
-                    "function": {
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments,
-                    },
-                }
-                for tool_call in message.tool_calls
-            ],
-        }
-        messages.append(assistant_message)
-
-        for tool_call in message.tool_calls:
-            try:
-                arguments = json.loads(tool_call.function.arguments or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-            tool_query = arguments.get("query", query)
-            tool_result = run_tool(tool_call.function.name, tool_query)
-            trace_event(
-                "tool_executed",
-                request_id=request_id,
-                query=query,
-                tool_name=tool_call.function.name,
-                tool_query=tool_query,
-                decision_source="llm_tool_call",
-            )
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_result,
-                }
-            )
-
-    trace_event("agent_fallback", request_id=request_id, query=query, reason="tool_loop_exhausted")
-    return _local_agent(query, request_id)
+    # Give the freshly fetched web material one small generation step so the user gets an answer,
+    # and the content stays in the knowledge base for future questions.
+    final_answer = summarize_text(
+        f"Question: {query}\n\nRelevant web evidence:\n{web_answer}"
+    )
+    trace_event(
+        "agent_web_fallback_completed",
+        request_id=request_id,
+        query=query,
+        route="web_search",
+    )
+    return f"Reason: {fallback_reason}\n\nWeb fallback answer:\n{final_answer}\n\nEvidence:\n{web_answer}"

@@ -1,104 +1,16 @@
 from __future__ import annotations
 
-import json
-import math
 import re
-from collections import Counter
-from functools import lru_cache
-from pathlib import Path
-from typing import Dict, List
 
-DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "corpus.json"
-
-DEFAULT_CORPUS = [
-    {
-        "id": "fallback-1",
-        "title": "RAG basics",
-        "source": "fallback",
-        "content": "Retrieval augmented generation combines retrieval and generation. The retriever finds relevant passages and the generator uses them to answer the question.",
-    },
-    {
-        "id": "fallback-2",
-        "title": "Tool calling loop",
-        "source": "fallback",
-        "content": "Tool calling works when the app sends a schema, executes the tool, and feeds the result back into the model.",
-    },
-    {
-        "id": "fallback-3",
-        "title": "MCP registry",
-        "source": "fallback",
-        "content": "A shared registry keeps tool definitions and handlers consistent across the backend and the frontend.",
-    },
-]
-
-
-def _load_corpus() -> List[Dict[str, str]]:
-    if DATA_PATH.exists():
-        with DATA_PATH.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if isinstance(data, list) and data:
-            return data
-    return DEFAULT_CORPUS
-
-
-def _tokenize(text: str) -> List[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
-
-
-def _excerpt(text: str, limit: int = 220) -> str:
-    cleaned = " ".join(text.split())
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: limit - 3].rsplit(" ", 1)[0] + "..."
-
-
-@lru_cache(maxsize=1)
-def _build_index():
-    corpus = _load_corpus()
-    tokenized_docs = []
-    document_frequency = Counter()
-
-    for item in corpus:
-        tokens = _tokenize(f"{item['title']} {item['content']}")
-        tokenized_docs.append(tokens)
-        document_frequency.update(set(tokens))
-
-    total_docs = len(corpus)
-    idf = {
-        token: math.log((1 + total_docs) / (1 + df)) + 1.0
-        for token, df in document_frequency.items()
-    }
-
-    doc_vectors = []
-    for tokens in tokenized_docs:
-        term_frequency = Counter(tokens)
-        vector = {token: term_frequency[token] * idf.get(token, 1.0) for token in term_frequency}
-        magnitude = math.sqrt(sum(weight * weight for weight in vector.values())) or 1.0
-        normalized = {token: weight / magnitude for token, weight in vector.items()}
-        doc_vectors.append(normalized)
-
-    return corpus, doc_vectors, idf
-
-
-def _score_query(query: str, idf: Dict[str, float]) -> Dict[str, float]:
-    tokens = _tokenize(query)
-    term_frequency = Counter(tokens)
-    vector = {token: term_frequency[token] * idf.get(token, 0.5) for token in term_frequency}
-    magnitude = math.sqrt(sum(weight * weight for weight in vector.values())) or 1.0
-    return {token: weight / magnitude for token, weight in vector.items()}
-
-
-def _rank_documents(query: str):
-    corpus, doc_vectors, idf = _build_index()
-    query_vector = _score_query(query, idf)
-    scored = []
-
-    for item, doc_vector in zip(corpus, doc_vectors):
-        score = sum(query_vector.get(token, 0.0) * weight for token, weight in doc_vector.items())
-        scored.append((score, item))
-
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return scored[:3]
+from app.services.knowledge_base import (
+    build_context,
+    confidence_label,
+    format_hits,
+    knowledge_miss,
+    search_knowledge,
+)
+from app.tools.utils import summarize_text
+from app.trace import trace_event
 
 
 def search_docs(query: str):
@@ -106,17 +18,75 @@ def search_docs(query: str):
     if not query:
         return "No query provided for document search."
 
-    ranked = _rank_documents(query)
-    if not ranked or ranked[0][0] <= 0:
-        return "No strong match found in the local corpus."
+    hits = search_knowledge(query, limit=4)
+    if not hits or knowledge_miss(query):
+        trace_event("rag_miss", query=query)
+        return "No strong match found in the knowledge base."
 
-    lines = ["Local research matches:"]
-    for index, (score, item) in enumerate(ranked, start=1):
-        excerpt = _excerpt(item["content"])
-        lines.append(
-            f"{index}. {item['title']} [{item['source']}] (score: {score:.3f})\n"
-            f"   {excerpt}"
-        )
+    context = build_context(hits)
+    answer = summarize_text(
+        f"Question: {query}\n\nUse the following knowledge base context to answer clearly:\n{context}"
+    )
+    if not answer:
+        answer = "I found relevant knowledge base passages, but could not generate a concise answer."
 
-    return "\n".join(lines)
+    top_score = hits[0]["score"] if hits else None
+    confidence = confidence_label(top_score)
+    retrieval_mode = hits[0].get("retrieval_method", "lexical") if hits else "lexical"
 
+    trace_event(
+        "rag_hit",
+        query=query,
+        top_score=top_score,
+        confidence=confidence,
+        retrieval_mode=retrieval_mode,
+        hit_count=len(hits),
+    )
+
+    return (
+        f"Answer:\n{answer}\n\n"
+        f"Retrieval mode: {retrieval_mode}\n"
+        f"Retrieval confidence: {confidence}"
+        + (f" (top score: {top_score:.3f})" if top_score is not None else "")
+        + "\n\n"
+        f"Sources:\n{format_hits(hits)}"
+    )
+
+
+def extract_citations(answer_text: str):
+    if not answer_text or "Sources:" not in answer_text:
+        return []
+
+    sources_block = answer_text.split("Sources:", 1)[1].strip()
+    lines = [line.rstrip() for line in sources_block.splitlines()]
+    citations = []
+    current = None
+
+    header_pattern = re.compile(r"^\s*(\d+)\.\s+(.*?)\s+\[(.*?)\]\s+\(score:\s*([0-9.]+),\s*(.*?)\)\s*$")
+    for line in lines:
+        match = header_pattern.match(line)
+        if match:
+            if current:
+                citations.append(current)
+            current = {
+                "rank": int(match.group(1)),
+                "title": match.group(2).strip(),
+                "source": match.group(3).strip(),
+                "score": float(match.group(4)),
+                "retrieval_method": match.group(5).strip(),
+                "excerpt": "",
+            }
+            continue
+        if current is not None and line.strip():
+            text = line.strip()
+            if text.startswith("Title:") or text.startswith("Source:") or text.startswith("URL:") or text.startswith("Content:"):
+                continue
+            if current["excerpt"]:
+                current["excerpt"] += " " + text
+            else:
+                current["excerpt"] = text
+
+    if current:
+        citations.append(current)
+
+    return citations

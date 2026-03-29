@@ -1,80 +1,14 @@
 from __future__ import annotations
 
-import os
 import re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
+from app.services.ingestion_state import enqueue_share_task
+from app.services.scheduler import start_scheduler
+from app.services.delivery import queue_dummy_delivery
 from app.trace import trace_event
-
-DEFAULT_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
-
-
-def _now():
-    return datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
-
-
-def _normalize_time(hour: int, minute: int, meridiem: str | None):
-    if meridiem:
-        meridiem = meridiem.lower()
-        if meridiem == "pm" and hour != 12:
-            hour += 12
-        if meridiem == "am" and hour == 12:
-            hour = 0
-    return hour, minute
-
-
-def _parse_relative_datetime(query: str):
-    lowered = query.lower()
-    now = _now()
-
-    if "any time" in lowered or "whenever" in lowered or "as soon as possible" in lowered:
-        return None, "as soon as possible"
-
-    match = re.search(
-        r"\b(today|tomorrow)\b(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
-        lowered,
-    )
-    if match:
-        day_word, hour, minute, meridiem = match.groups()
-        hour = int(hour)
-        minute = int(minute or 0)
-        hour, minute = _normalize_time(hour, minute, meridiem)
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if day_word == "tomorrow":
-            target += timedelta(days=1)
-        elif target <= now:
-            target += timedelta(days=1)
-        return target, None
-
-    match = re.search(r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", lowered)
-    if match:
-        hour, minute, meridiem = match.groups()
-        hour = int(hour)
-        minute = int(minute or 0)
-        hour, minute = _normalize_time(hour, minute, meridiem)
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return target, None
-
-    if "tonight" in lowered:
-        target = now.replace(hour=20, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return target, None
-
-    if "tomorrow" in lowered:
-        target = now + timedelta(days=1)
-        return target.replace(hour=9, minute=0, second=0, microsecond=0), None
-
-    if "today" in lowered:
-        target = now.replace(hour=17, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return target, None
-
-    return None, None
+from app.tools.time_utils import DEFAULT_TIMEZONE, parse_relative_datetime
+from app.services.ingestion_state import chat_history_transcript
+from app.tools.utils import summarize_text
 
 
 def _detect_channel(query: str):
@@ -83,9 +17,9 @@ def _detect_channel(query: str):
         return "whatsapp"
     if "email" in lowered or "mail" in lowered or "e-mail" in lowered:
         return "email"
-    if "meeting" in lowered or "calendar" in lowered or "invite" in lowered:
-        return "meeting"
-    return "share"
+    if any(keyword in lowered for keyword in ["meeting", "calendar", "invite", "schedule", "task", "todo", "remind"]):
+        return None
+    return None
 
 
 def _suggest_endpoint(channel: str):
@@ -108,46 +42,240 @@ def _extract_content(query: str):
     return query.strip()
 
 
-def share_details(query: str):
+def _extract_recipient(query: str):
+    email_match = re.search(r"[\w.\-+]+@[\w.\-]+\.[A-Za-z]{2,}", query)
+    if email_match:
+        return email_match.group(0)
+
+    lower = query.lower()
+    for marker in [" to ", " for "]:
+        if marker in lower:
+            start = lower.index(marker) + len(marker)
+            remainder = query[start:].strip(" :-,")
+            if remainder:
+                return remainder.split(",")[0].split(" and ")[0].strip()
+    return None
+
+
+def _wants_summary_share(query: str) -> bool:
+    lowered = (query or "").lower()
+    has_share_intent = any(keyword in lowered for keyword in ["share", "send", "email", "mail", "whatsapp", "whats app"])
+    has_summary_intent = any(keyword in lowered for keyword in ["summary", "summarize", "summarise", "brief", "short version"])
+    return has_share_intent and has_summary_intent
+
+
+def _wants_full_conversation_share(query: str) -> bool:
+    lowered = (query or "").lower()
+    has_share_intent = any(keyword in lowered for keyword in ["share", "send", "email", "mail", "whatsapp", "whats app"])
+    has_conversation_intent = any(keyword in lowered for keyword in ["conversation", "chat history", "our conversation", "full conversation", "whole conversation"])
+    return has_share_intent and has_conversation_intent and not _wants_summary_share(query)
+
+
+def parse_share_request(query: str):
     query = (query or "").strip()
     if not query:
-        return "No share request provided."
+        return {
+            "error": "No share request provided.",
+            "channel": None,
+            "scheduled_for": None,
+            "time_note": None,
+            "content": "",
+            "recipient": None,
+            "endpoint": None,
+            "missing": ["request text"],
+        }
 
     channel = _detect_channel(query)
-    scheduled_for, time_note = _parse_relative_datetime(query)
+    scheduled_for, time_note = parse_relative_datetime(query)
     content = _extract_content(query)
+    recipient = _extract_recipient(query)
+
+    if not channel:
+        return {
+            "error": "Share agent only handles email or WhatsApp requests. Use the scheduler agent for meetings, reminders, and task scheduling.",
+            "channel": None,
+            "scheduled_for": scheduled_for.isoformat() if scheduled_for else None,
+            "time_note": time_note,
+            "content": content,
+            "recipient": recipient,
+            "endpoint": None,
+            "missing": ["channel"],
+        }
 
     needs = []
     if not scheduled_for and not time_note:
         time_note = "No time mentioned; treat as immediate unless you want it scheduled."
-    if channel in {"email", "whatsapp", "meeting"} and not any(
-        token in query.lower() for token in ["to ", "for ", "@", "recipient", "client", "team", "group"]
-    ):
+    if channel in {"email", "whatsapp"} and not recipient:
         needs.append("recipient")
     if len(content) < 15:
         needs.append("message content")
 
-    lines = [f"Action: {channel}"]
-    lines.append(f"Suggested endpoint: {_suggest_endpoint(channel)}")
-    if scheduled_for:
-        lines.append(f"Schedule: {scheduled_for.isoformat()}")
-        lines.append(f"Timezone: {DEFAULT_TIMEZONE}")
-    elif time_note:
-        lines.append(f"Schedule: {time_note}")
+    return {
+        "query": query,
+        "channel": channel,
+        "scheduled_for": scheduled_for.isoformat() if scheduled_for else None,
+        "time_note": time_note,
+        "content": content,
+        "recipient": recipient,
+        "endpoint": _suggest_endpoint(channel),
+        "missing": needs,
+    }
 
-    lines.append(f"Draft: {content}")
-    if needs:
-        lines.append("Missing details: " + ", ".join(needs))
+
+def _required_share_fields(plan: dict) -> list[str]:
+    missing = []
+    channel = plan.get("channel")
+    recipient = (plan.get("recipient") or "").strip() if plan.get("recipient") else None
+    content = (plan.get("content") or "").strip()
+
+    if not channel:
+        missing.append("channel")
+    if channel in {"email", "whatsapp"} and not recipient:
+        missing.append("recipient")
+    if len(content) < 8 or content.lower() in {"details", "this", "that", "it", "message"}:
+        missing.append("message content")
+
+    for item in plan.get("missing", []):
+        if item not in missing:
+            missing.append(item)
+    return missing
+
+
+def share_details(query: str, context: str | None = None, *, source: str = "chat", actor: str = "user"):
+    plan = parse_share_request(query)
+    if plan.get("error"):
+        return plan["error"]
+
+    if context:
+        context = context.strip()
+        if context:
+            if _wants_summary_share(query):
+                plan["content"] = context
+            elif len(plan.get("content") or "") < 15 or (plan.get("content") or "").lower() in {"this", "that", "it", "details", "summary"}:
+                plan["content"] = context
+    elif _wants_summary_share(query):
+        plan["content"] = summarize_text(query)
+    elif _wants_full_conversation_share(query):
+        transcript = chat_history_transcript(limit=24)
+        if transcript:
+            plan["content"] = transcript
+
+    missing = _required_share_fields(plan)
+    if missing:
+        lines = ["Share request needs a bit more detail before I can proceed."]
+        if plan.get("channel"):
+            lines.append(f"Channel: {plan['channel']}")
+        if plan.get("scheduled_for"):
+            lines.append(f"Schedule: {plan['scheduled_for']}")
+        if plan.get("time_note") and not plan.get("scheduled_for"):
+            lines.append(f"Schedule note: {plan['time_note']}")
+        lines.append("Missing details: " + ", ".join(missing))
+        lines.append("Please provide the missing details, then I can share now or schedule it.")
+        trace_event(
+            "share_plan_missing_details",
+            query=plan["query"],
+            channel=plan["channel"],
+            scheduled_for=plan["scheduled_for"],
+            missing_details=missing,
+        )
+        return "\n".join(lines)
+
+    if plan.get("scheduled_for"):
+        if _wants_full_conversation_share(query) and not plan.get("content"):
+            transcript = chat_history_transcript(limit=24)
+            if transcript:
+                plan["content"] = transcript
+        task = enqueue_share_task(
+            {
+                "kind": "share",
+                "channel": plan["channel"],
+                "scheduled_for": plan.get("scheduled_for"),
+                "status": "scheduled",
+                "source": source,
+                "actor": actor,
+                "query": plan["query"],
+                "recipient": plan.get("recipient"),
+                "subject": plan.get("content")[:64] or None,
+                "message": plan.get("content"),
+                "time_note": plan.get("time_note"),
+            }
+        )
+        start_scheduler()
+
+        lines = [f"Action: {plan['channel']}"]
+        lines.append("State: saved to share_task list")
+        lines.append(f"Task id: {task['id']}")
+        lines.append(f"Schedule: {plan['scheduled_for']}")
+        lines.append(f"Timezone: {DEFAULT_TIMEZONE}")
+        if plan.get("recipient"):
+            lines.append(f"Recipient: {plan['recipient']}")
+        lines.append(f"Draft: {plan['content']}")
+        lines.append("Status: ready in shared state for later processing.")
     else:
-        lines.append("Status: ready to hand off to an email, WhatsApp, or calendar integration.")
+        if _wants_full_conversation_share(query) and not plan.get("content"):
+            transcript = chat_history_transcript(limit=24)
+            if transcript:
+                plan["content"] = transcript
+        delivery = execute_share_action(
+            {
+                "id": None,
+                "kind": "share",
+                "channel": plan["channel"],
+                "scheduled_for": None,
+                "status": "completed",
+                "source": source,
+                "actor": actor,
+                "query": plan["query"],
+                "recipient": plan.get("recipient"),
+                "subject": plan.get("content")[:64] or None,
+                "message": plan["content"],
+                "time_note": plan.get("time_note"),
+            }
+        )
+
+        lines = [f"Action: {plan['channel']}"]
+        lines.append("State: shared immediately")
+        if plan.get("recipient"):
+            lines.append(f"Recipient: {plan['recipient']}")
+        lines.append(f"Draft: {plan['content']}")
+        lines.append(f"Delivery id: {delivery['delivery_id']}")
+        lines.append("Status: completed")
+        if plan["time_note"]:
+            lines.append(f"Schedule note: {plan['time_note']}")
 
     trace_event(
         "share_plan_created",
-        query=query,
-        channel=channel,
-        scheduled_for=scheduled_for.isoformat() if scheduled_for else None,
-        suggested_endpoint=_suggest_endpoint(channel),
-        missing_details=needs,
+        query=plan["query"],
+        channel=plan["channel"],
+        scheduled_for=plan["scheduled_for"],
+        queue_id=task["id"] if plan.get("scheduled_for") else delivery["delivery_id"],
+        missing_details=missing,
+        source=source,
+        actor=actor,
     )
 
     return "\n".join(lines)
+
+
+def execute_share_action(action: dict):
+    channel = str(action.get("channel") or "email")
+    recipient = action.get("recipient")
+    subject = action.get("subject")
+    message = str(action.get("message") or action.get("query") or "")
+    scheduled_for = action.get("scheduled_for")
+    trace_event(
+        "share_action_executed",
+        action_id=action.get("id"),
+        channel=channel,
+        recipient=recipient,
+        scheduled_for=scheduled_for,
+        source=action.get("source"),
+        actor=action.get("actor"),
+    )
+    return queue_dummy_delivery(
+        channel=channel,
+        recipient=recipient,
+        subject=subject,
+        scheduled_for=scheduled_for,
+        message=message,
+    )

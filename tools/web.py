@@ -5,6 +5,11 @@ import re
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
+from app.services.ingestion_state import load_state, record_web_search
+from app.services.knowledge_base import upsert_document
+from app.tools.scrape import remember_sources_from_web_results
+from app.trace import trace_event
+
 
 def _strip_tags(value: str) -> str:
     return re.sub(r"<[^>]+>", "", html.unescape(value))
@@ -51,12 +56,41 @@ def web_search(query: str):
     if not results:
         return f"No live web results could be parsed for: {query}"
 
+    added_urls = remember_sources_from_web_results(query, results)
+
     lines = [f"Live web results for: {query}"]
+    lines.append("Reason: No strong match was found in the knowledge base, so live web search was used.")
     for index, result in enumerate(results[:3], start=1):
         lines.append(
             f"{index}. {result['title']}\n"
             f"   {result['url']}\n"
             f"   {result['snippet']}"
         )
-    return "\n".join(lines)
+    formatted = "\n".join(lines)
 
+    upsert_document(
+        source="web search",
+        title=f"Web search: {query}",
+        content=formatted,
+        url=search_url,
+        doc_type="web",
+        metadata={"query": query, "result_count": len(results)},
+    )
+    trace_event(
+        "web_search_saved",
+        query=query,
+        result_count=len(results),
+        added_config_urls=added_urls,
+        url=search_url,
+    )
+    record_web_search(query=query, result_count=len(results), added_urls=added_urls)
+
+    if added_urls:
+        formatted += "\n\nAdded to scrape config:\n" + "\n".join(f"- {url}" for url in added_urls)
+    else:
+        formatted += "\n\nAdded to scrape config: none"
+    state = load_state()
+    if state.get("refresh_pending"):
+        formatted += "\nPending scrape refresh: yes"
+    formatted += "\nSaved to knowledge base: yes"
+    return formatted

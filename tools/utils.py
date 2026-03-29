@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import re
 
+from app.services.ingestion_state import chat_history_transcript
+
 try:
     from openai import OpenAI
 except ImportError:  # pragma: no cover - optional dependency
@@ -31,10 +33,25 @@ def _local_summary(text: str) -> str:
     return summary[:400] + ("..." if len(summary) > 400 else "")
 
 
+def _wants_conversation_summary(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(keyword in lowered for keyword in ["our conversation", "this conversation", "chat history", "conversation so far", "summarize our conversation", "summarise our conversation"])
+
+
 def summarize_text(query: str):
     text = (query or "").strip()
     if not text:
         return "No text provided to summarize."
+
+    if _wants_conversation_summary(text):
+        transcript = chat_history_transcript(limit=24)
+        if transcript:
+            text = (
+                "Summarize the conversation below. Focus on the main requests, decisions, and outcomes.\n\n"
+                f"{transcript}"
+            )
+        else:
+            return "No conversation history found yet to summarize."
 
     client = _client()
     if client is None:

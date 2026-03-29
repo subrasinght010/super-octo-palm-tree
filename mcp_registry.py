@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from app.tools.rag import search_docs
 from app.tools.share import share_details
+from app.tools.schedule import schedule_task
+from app.tools.scrape import scrape_configured_sites
 from app.tools.utils import summarize_text
 from app.tools.web import web_search
 
@@ -57,19 +59,51 @@ TOOLS = [
     },
     {
         "name": "share_details",
-        "description": "Prepare a share or schedule plan for email, WhatsApp, or meeting requests.",
+        "description": "Prepare a sharing plan for email or WhatsApp requests.",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural language share or schedule request.",
+                    "description": "Natural language email or WhatsApp share request.",
                 }
             },
             "required": ["query"],
             "additionalProperties": False,
         },
         "handler": share_details,
+    },
+    {
+        "name": "schedule_task",
+        "description": "Prepare a task, reminder, or meeting schedule plan from the query.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural language task scheduling request.",
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "handler": schedule_task,
+    },
+    {
+        "name": "scrape_configured_sites",
+        "description": "Scrape configured websites from config and return useful excerpts.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to look for while scraping configured sources.",
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "handler": scrape_configured_sites,
     },
 ]
 
@@ -108,10 +142,21 @@ def run_tool(name: str, query: str) -> str:
 
 def route_query(query: str) -> str:
     lowered = query.lower()
-    if any(keyword in lowered for keyword in ["email", "mail", "whatsapp", "whats app", "meeting", "schedule", "calendar", "invite", "share", "send"]):
+    if any(keyword in lowered for keyword in ["scrape", "crawl", "extract from site", "extract from websites", "configured sites", "given web", "web given in config"]):
+        return "scrape_configured_sites"
+    if any(keyword in lowered for keyword in ["meeting", "schedule", "calendar", "invite", "remind", "reminder", "task", "todo", "appointment"]):
+        return "schedule_task"
+    if (
+        any(keyword in lowered for keyword in ["summary", "summarize", "summarise", "brief", "short version", "tldr", "tl;dr"])
+        and any(keyword in lowered for keyword in ["email", "mail", "whatsapp", "whats app", "share", "send", "@"])
+    ):
+        return "clarify_summary_share"
+    if any(keyword in lowered for keyword in ["email", "mail", "whatsapp", "whats app"]) or "@" in lowered:
         return "share_details"
+    if any(keyword in lowered for keyword in ["summary", "summarize", "summarise", "brief", "short version", "tldr", "tl;dr"]):
+        return "summarize_text"
     if any(keyword in lowered for keyword in ["latest", "current", "today", "news", "recent", "breaking"]):
         return "web_search"
     if any(keyword in lowered for keyword in ["rag", "pdf", "document", "docs", "paper", "note", "corpus", "research"]):
         return "search_docs"
-    return "summarize_text"
+    return "search_docs"
